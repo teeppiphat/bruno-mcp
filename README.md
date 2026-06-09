@@ -281,20 +281,27 @@ src/
 ├── server.ts             # MCP server implementation
 ├── bruno/
 │   ├── types.ts          # TypeScript interfaces
-│   ├── generator.ts      # BRU file generator
+│   ├── generator.ts      # BRU file generator (delegates to @usebruno/lang)
 │   ├── collection.ts     # Collection management
 │   ├── environment.ts    # Environment management
-│   └── request.ts        # Request builder
-└── tools/                # Individual MCP tools
+│   ├── request.ts        # Request builder
+│   └── paths.ts          # Path-traversal-safe path resolution
 ```
 
 ### Building
 
 ```bash
-npm run build      # Build TypeScript
+npm run build      # Transpile src/ -> dist/ (transpile-only, see note below)
+npm run typecheck  # Type-check with tsc --noEmit
 npm run dev        # Development mode
 npm run clean      # Clean build artifacts
 ```
+
+> **Note:** `npm run build` uses a transpile-only build (`scripts/build.mjs`)
+> rather than `tsc`. The combination of zod's deeply-recursive inferred types
+> and the MCP SDK generics can drive the type checker into a multi-GB blow-up on
+> some Node builds. Type errors are still surfaced separately via
+> `npm run typecheck` on machines/CI where the checker fits in memory.
 
 ### Code Quality
 

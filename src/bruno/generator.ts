@@ -1,25 +1,27 @@
 /**
- * BRU file generator with proper syntax
- * Generates Bruno API testing files in the correct BRU format
+ * BRU file generator.
+ *
+ * Serialization is delegated to Bruno's own `@usebruno/lang` (`jsonToBruV2`)
+ * rather than hand-built string concatenation. The previous hand-rolled
+ * generator wrapped every value in single quotes (e.g. `name: 'My Request'`),
+ * which is NOT Bruno's format — Bruno values are raw to end-of-line, so those
+ * files round-tripped with literal quotes baked into the values, and a value
+ * containing `'''` produced a file Bruno's parser rejected outright. Using the
+ * official serializer guarantees round-trip-correct output and removes the
+ * whole class of escaping/injection bugs.
  */
-
+import pkg from '@usebruno/lang';
 import {
   BruFile,
-  BruMeta,
-  BruHttpRequest,
   BruAuth,
-  BruHeaders,
-  BruQuery,
-  BruBody,
-  BruVars,
-  BruPreRequestScript,
-  BruPostResponseScript,
-  BruTests,
   BruGeneratorOptions,
   BruValidationError,
-  AuthType,
   BodyType
 } from './types.js';
+
+const { jsonToBruV2 } = pkg as {
+  jsonToBruV2: (json: unknown) => string;
+};
 
 export class BruGenerator {
   private options: Required<BruGeneratorOptions>;
@@ -34,293 +36,212 @@ export class BruGenerator {
   }
 
   /**
-   * Generate a complete .bru file from a BruFile object
+   * Generate a complete .bru file from a BruFile object.
    */
   generateBruFile(bruFile: BruFile): string {
     if (this.options.validateSyntax) {
       this.validateBruFile(bruFile);
     }
 
-    const sections: string[] = [];
+    const json = this.toBrunoJson(bruFile);
+    let output = jsonToBruV2(json);
 
-    // Add timestamp comment if requested
     if (this.options.addTimestamp) {
-      sections.push(`# Generated on ${new Date().toISOString()}`);
-      sections.push('');
+      output = `# Generated on ${new Date().toISOString()}\n\n${output}`;
     }
 
-    // Generate meta block
-    sections.push(this.generateMetaBlock(bruFile.meta));
-    sections.push('');
+    return output;
+  }
 
-    // Generate HTTP block
-    sections.push(this.generateHttpBlock(bruFile.http));
-    sections.push('');
+  /**
+   * Map our internal BruFile structure to the JSON shape expected by
+   * `@usebruno/lang`'s v2 serializer.
+   */
+  private toBrunoJson(bruFile: BruFile): Record<string, unknown> {
+    const json: Record<string, unknown> = {
+      meta: {
+        name: bruFile.meta.name,
+        type: bruFile.meta.type,
+        ...(bruFile.meta.seq !== undefined ? { seq: bruFile.meta.seq } : {})
+      },
+      http: {
+        method: bruFile.http.method.toLowerCase(),
+        url: bruFile.http.url,
+        body: this.mapBodyType(bruFile.http.body),
+        auth: this.mapAuthType(bruFile.http.auth)
+      }
+    };
 
-    // Generate auth block if present
-    if (bruFile.auth && bruFile.auth.type !== 'none') {
-      sections.push(this.generateAuthBlock(bruFile.auth));
-      sections.push('');
-    }
-
-    // Generate headers block if present
-    if (bruFile.headers && Object.keys(bruFile.headers).length > 0) {
-      sections.push(this.generateHeadersBlock(bruFile.headers));
-      sections.push('');
-    }
-
-    // Generate query block if present
+    // Query parameters -> params:query
     if (bruFile.query && Object.keys(bruFile.query).length > 0) {
-      sections.push(this.generateQueryBlock(bruFile.query));
-      sections.push('');
+      json.params = Object.entries(bruFile.query).map(([name, value]) => ({
+        name,
+        value: String(value),
+        type: 'query',
+        enabled: true
+      }));
     }
 
-    // Generate body block if present
+    // Headers -> array form
+    if (bruFile.headers && Object.keys(bruFile.headers).length > 0) {
+      json.headers = Object.entries(bruFile.headers).map(([name, value]) => ({
+        name,
+        value: String(value),
+        enabled: true
+      }));
+    }
+
+    // Auth block
+    if (bruFile.auth && bruFile.auth.type !== 'none') {
+      const auth = this.mapAuth(bruFile.auth);
+      if (auth) {
+        json.auth = auth;
+      }
+    }
+
+    // Body block
     if (bruFile.body && bruFile.body.type !== 'none') {
-      sections.push(this.generateBodyBlock(bruFile.body));
-      sections.push('');
+      const body = this.mapBody(bruFile.body);
+      if (body) {
+        json.body = body;
+      }
     }
 
-    // Generate vars block if present
+    // Vars -> vars.req
     if (bruFile.vars && Object.keys(bruFile.vars).length > 0) {
-      sections.push(this.generateVarsBlock(bruFile.vars));
-      sections.push('');
+      json.vars = {
+        req: Object.entries(bruFile.vars).map(([name, value]) => ({
+          name,
+          value: String(value),
+          enabled: true,
+          local: false
+        }))
+      };
     }
 
-    // Generate script blocks if present
+    // Scripts
     if (bruFile.script) {
+      const script: Record<string, string> = {};
       if (bruFile.script['pre-request']) {
-        sections.push(this.generatePreRequestScript(bruFile.script['pre-request']));
-        sections.push('');
+        script.req = bruFile.script['pre-request'].exec.join('\n');
       }
       if (bruFile.script['post-response']) {
-        sections.push(this.generatePostResponseScript(bruFile.script['post-response']));
-        sections.push('');
+        script.res = bruFile.script['post-response'].exec.join('\n');
+      }
+      if (Object.keys(script).length > 0) {
+        json.script = script;
       }
     }
 
-    // Generate tests block if present
-    if (bruFile.tests) {
-      sections.push(this.generateTestsBlock(bruFile.tests));
-      sections.push('');
+    // Tests
+    if (bruFile.tests && bruFile.tests.exec.length > 0) {
+      json.tests = bruFile.tests.exec.join('\n');
     }
 
-    // Generate docs if present
+    // Docs
     if (bruFile.docs) {
-      sections.push('docs {');
-      sections.push(this.indent(bruFile.docs));
-      sections.push('}');
-      sections.push('');
+      json.docs = bruFile.docs;
     }
 
-    return sections.join('\n').trim() + '\n';
+    return json;
   }
 
-  /**
-   * Generate meta block
-   */
-  private generateMetaBlock(meta: BruMeta): string {
-    const lines = ['meta {'];
-    lines.push(this.indent(`name: ${this.escapeString(meta.name)}`));
-    lines.push(this.indent(`type: ${meta.type}`));
-    if (meta.seq !== undefined) {
-      lines.push(this.indent(`seq: ${meta.seq}`));
+  /** Map our BodyType to the value Bruno uses in the `http { body: ... }` line. */
+  private mapBodyType(body: BodyType): string {
+    switch (body) {
+      case 'form-data':
+        return 'multipartForm';
+      case 'form-urlencoded':
+        return 'formUrlEncoded';
+      case 'json':
+      case 'text':
+      case 'xml':
+        return body;
+      default:
+        return 'none';
     }
-    lines.push('}');
-    return lines.join('\n');
   }
 
-  /**
-   * Generate HTTP request block
-   */
-  private generateHttpBlock(http: BruHttpRequest): string {
-    const lines = [`${http.method.toLowerCase()} {`];
-    lines.push(this.indent(`url: ${this.escapeString(http.url)}`));
-    lines.push(this.indent(`body: ${http.body}`));
-    lines.push(this.indent(`auth: ${http.auth}`));
-    lines.push('}');
-    return lines.join('\n');
+  /** Map our AuthType to the value Bruno uses in the `http { auth: ... }` line. */
+  private mapAuthType(auth: string): string {
+    return auth === 'api-key' ? 'apikey' : auth;
   }
 
-  /**
-   * Generate auth block
-   */
-  private generateAuthBlock(auth: BruAuth): string {
-    const lines = [`auth:${auth.type} {`];
-
+  /** Map an auth config to the `@usebruno/lang` auth object. */
+  private mapAuth(auth: BruAuth): Record<string, unknown> | null {
     switch (auth.type) {
       case 'bearer':
-        if (auth.bearer) {
-          lines.push(this.indent(`token: ${this.escapeString(auth.bearer.token)}`));
-        }
-        break;
+        return auth.bearer ? { bearer: { token: auth.bearer.token } } : null;
       case 'basic':
-        if (auth.basic) {
-          lines.push(this.indent(`username: ${this.escapeString(auth.basic.username)}`));
-          lines.push(this.indent(`password: ${this.escapeString(auth.basic.password)}`));
-        }
-        break;
-      case 'oauth2':
-        if (auth.oauth2) {
-          lines.push(this.indent(`grant_type: ${auth.oauth2.grantType}`));
-          if (auth.oauth2.accessTokenUrl) {
-            lines.push(this.indent(`access_token_url: ${this.escapeString(auth.oauth2.accessTokenUrl)}`));
-          }
-          if (auth.oauth2.authorizationUrl) {
-            lines.push(this.indent(`authorization_url: ${this.escapeString(auth.oauth2.authorizationUrl)}`));
-          }
-          if (auth.oauth2.clientId) {
-            lines.push(this.indent(`client_id: ${this.escapeString(auth.oauth2.clientId)}`));
-          }
-          if (auth.oauth2.clientSecret) {
-            lines.push(this.indent(`client_secret: ${this.escapeString(auth.oauth2.clientSecret)}`));
-          }
-          if (auth.oauth2.scope) {
-            lines.push(this.indent(`scope: ${this.escapeString(auth.oauth2.scope)}`));
-          }
-          if (auth.oauth2.username) {
-            lines.push(this.indent(`username: ${this.escapeString(auth.oauth2.username)}`));
-          }
-          if (auth.oauth2.password) {
-            lines.push(this.indent(`password: ${this.escapeString(auth.oauth2.password)}`));
-          }
-        }
-        break;
+        return auth.basic
+          ? { basic: { username: auth.basic.username, password: auth.basic.password } }
+          : null;
       case 'api-key':
-        if (auth.apikey) {
-          lines.push(this.indent(`key: ${this.escapeString(auth.apikey.key)}`));
-          lines.push(this.indent(`value: ${this.escapeString(auth.apikey.value)}`));
-          lines.push(this.indent(`in: ${auth.apikey.in}`));
-        }
-        break;
+        return auth.apikey
+          ? {
+              apikey: {
+                key: auth.apikey.key,
+                value: auth.apikey.value,
+                placement: auth.apikey.in
+              }
+            }
+          : null;
       case 'digest':
-        if (auth.digest) {
-          lines.push(this.indent(`username: ${this.escapeString(auth.digest.username)}`));
-          lines.push(this.indent(`password: ${this.escapeString(auth.digest.password)}`));
-        }
-        break;
+        return auth.digest
+          ? { digest: { username: auth.digest.username, password: auth.digest.password } }
+          : null;
+      case 'oauth2':
+        if (!auth.oauth2) return null;
+        return {
+          oauth2: {
+            grant_type: auth.oauth2.grantType,
+            access_token_url: auth.oauth2.accessTokenUrl ?? '',
+            authorization_url: auth.oauth2.authorizationUrl ?? '',
+            client_id: auth.oauth2.clientId ?? '',
+            client_secret: auth.oauth2.clientSecret ?? '',
+            scope: auth.oauth2.scope ?? '',
+            username: auth.oauth2.username ?? '',
+            password: auth.oauth2.password ?? ''
+          }
+        };
+      default:
+        return null;
     }
-
-    lines.push('}');
-    return lines.join('\n');
   }
 
-  /**
-   * Generate headers block
-   */
-  private generateHeadersBlock(headers: BruHeaders): string {
-    const lines = ['headers {'];
-    Object.entries(headers).forEach(([key, value]) => {
-      lines.push(this.indent(`${key}: ${this.escapeString(value)}`));
-    });
-    lines.push('}');
-    return lines.join('\n');
-  }
-
-  /**
-   * Generate query parameters block
-   */
-  private generateQueryBlock(query: BruQuery): string {
-    const lines = ['query {'];
-    Object.entries(query).forEach(([key, value]) => {
-      lines.push(this.indent(`${key}: ${this.formatValue(value)}`));
-    });
-    lines.push('}');
-    return lines.join('\n');
-  }
-
-  /**
-   * Generate body block
-   */
-  private generateBodyBlock(body: BruBody): string {
-    if (body.type === 'none') {
-      return '';
+  /** Map a body config to the `@usebruno/lang` body object. */
+  private mapBody(body: NonNullable<BruFile['body']>): Record<string, unknown> | null {
+    switch (body.type) {
+      case 'json':
+        return { json: body.content ?? '' };
+      case 'text':
+        return { text: body.content ?? '' };
+      case 'xml':
+        return { xml: body.content ?? '' };
+      case 'form-data':
+        return {
+          multipartForm: (body.formData ?? []).map(f => ({
+            name: f.name,
+            value: f.value,
+            type: f.type ?? 'text',
+            enabled: f.enabled !== false
+          }))
+        };
+      case 'form-urlencoded':
+        return {
+          formUrlEncoded: (body.formUrlEncoded ?? []).map(f => ({
+            name: f.name,
+            value: f.value,
+            enabled: f.enabled !== false
+          }))
+        };
+      default:
+        return null;
     }
-
-    if (body.type === 'json' || body.type === 'text' || body.type === 'xml') {
-      const lines = [`body:${body.type} {`];
-      if (body.content) {
-        lines.push(this.indent(body.content));
-      }
-      lines.push('}');
-      return lines.join('\n');
-    }
-
-    if (body.type === 'form-data' && body.formData) {
-      const lines = ['body:multipart-form {'];
-      body.formData.forEach(field => {
-        if (field.enabled !== false) {
-          lines.push(this.indent(`${field.name}: ${this.escapeString(field.value)}`));
-        }
-      });
-      lines.push('}');
-      return lines.join('\n');
-    }
-
-    if (body.type === 'form-urlencoded' && body.formUrlEncoded) {
-      const lines = ['body:form-urlencoded {'];
-      body.formUrlEncoded.forEach(field => {
-        if (field.enabled !== false) {
-          lines.push(this.indent(`${field.name}: ${this.escapeString(field.value)}`));
-        }
-      });
-      lines.push('}');
-      return lines.join('\n');
-    }
-
-    return '';
   }
 
   /**
-   * Generate variables block
-   */
-  private generateVarsBlock(vars: BruVars): string {
-    const lines = ['vars {'];
-    Object.entries(vars).forEach(([key, value]) => {
-      lines.push(this.indent(`${key}: ${this.formatValue(value)}`));
-    });
-    lines.push('}');
-    return lines.join('\n');
-  }
-
-  /**
-   * Generate pre-request script block
-   */
-  private generatePreRequestScript(script: BruPreRequestScript): string {
-    const lines = ['script:pre-request {'];
-    script.exec.forEach(line => {
-      lines.push(this.indent(line));
-    });
-    lines.push('}');
-    return lines.join('\n');
-  }
-
-  /**
-   * Generate post-response script block
-   */
-  private generatePostResponseScript(script: BruPostResponseScript): string {
-    const lines = ['script:post-response {'];
-    script.exec.forEach(line => {
-      lines.push(this.indent(line));
-    });
-    lines.push('}');
-    return lines.join('\n');
-  }
-
-  /**
-   * Generate tests block
-   */
-  private generateTestsBlock(tests: BruTests): string {
-    const lines = ['tests {'];
-    tests.exec.forEach(line => {
-      lines.push(this.indent(line));
-    });
-    lines.push('}');
-    return lines.join('\n');
-  }
-
-  /**
-   * Validate BRU file structure
+   * Validate BRU file structure.
    */
   private validateBruFile(bruFile: BruFile): void {
     if (!bruFile.meta || !bruFile.meta.name) {
@@ -343,7 +264,7 @@ export class BruGenerator {
   }
 
   /**
-   * Validate authentication configuration
+   * Validate authentication configuration.
    */
   private validateAuthConfig(auth: BruAuth): void {
     switch (auth.type) {
@@ -366,7 +287,7 @@ export class BruGenerator {
   }
 
   /**
-   * Basic URL validation
+   * Basic URL validation.
    */
   private isValidUrl(url: string): boolean {
     try {
@@ -377,46 +298,10 @@ export class BruGenerator {
       return url.startsWith('/') || url.includes('{{') || url.startsWith('http');
     }
   }
-
-  /**
-   * Escape string values for BRU format
-   */
-  private escapeString(value: string): string {
-    // BRU uses single quotes for strings
-    if (value.includes("'") || value.includes('\n') || value.includes('\r')) {
-      // Use multiline string format for complex strings
-      return `'''${value}'''`;
-    }
-    return `'${value}'`;
-  }
-
-  /**
-   * Format various value types
-   */
-  private formatValue(value: string | number | boolean): string {
-    if (typeof value === 'string') {
-      return this.escapeString(value);
-    }
-    return String(value);
-  }
-
-  /**
-   * Add indentation to a line
-   */
-  private indent(text: string): string {
-    const indentChar = this.options.useSpaces ? ' ' : '\t';
-    const indentString = this.options.useSpaces ? 
-      indentChar.repeat(this.options.indentSize) : 
-      indentChar;
-    
-    return text.split('\n').map(line => 
-      line.trim() ? indentString + line : line
-    ).join('\n');
-  }
 }
 
 /**
- * Convenience function to generate a BRU file
+ * Convenience function to generate a BRU file.
  */
 export function generateBruFile(bruFile: BruFile, options?: BruGeneratorOptions): string {
   const generator = new BruGenerator(options);
@@ -424,7 +309,7 @@ export function generateBruFile(bruFile: BruFile, options?: BruGeneratorOptions)
 }
 
 /**
- * Create a basic BRU file structure
+ * Create a basic BRU file structure.
  */
 export function createBasicBruFile(
   name: string,

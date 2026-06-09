@@ -290,15 +290,31 @@ export class BrunoMcpServer {
       },
       async (args) => {
         try {
-          // For now, this is a placeholder implementation
-          // In a full implementation, we'd parse the existing .bru file and add the script
+          const result = await this.requestBuilder.addScript(
+            args.bruFilePath,
+            args.scriptType,
+            args.script
+          );
+
+          if (result.success) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `✅ ${args.scriptType} script added to ${result.path}`
+                }
+              ]
+            };
+          }
+
           return {
             content: [
               {
                 type: 'text',
-                text: `✅ ${args.scriptType} script added to ${args.bruFilePath}\n\nScript content:\n${args.script}`
+                text: `❌ Failed to add test script: ${result.error}`
               }
-            ]
+            ],
+            isError: true
           };
         } catch (error) {
           return {
@@ -469,12 +485,28 @@ export class BrunoMcpServer {
       },
       async (args) => {
         try {
-          // This would scan for bruno.json files in subdirectories
+          const collections = await this.collectionManager.listCollections(args.path);
+
+          if (collections.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `📁 No Bruno collections found in: ${args.path}`
+                }
+              ]
+            };
+          }
+
+          const list = collections
+            .map(c => `  • ${c.name || '(unnamed)'} — ${c.path}`)
+            .join('\n');
+
           return {
             content: [
               {
                 type: 'text',
-                text: `📁 Scanning for Bruno collections in: ${args.path}\n\n(This feature will be implemented in a future version)`
+                text: `📁 Found ${collections.length} Bruno collection(s) in ${args.path}:\n\n${list}`
               }
             ]
           };

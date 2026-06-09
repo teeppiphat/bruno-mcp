@@ -12,6 +12,12 @@ import {
   BrunoError,
   BruFileError
 } from './types.js';
+import { resolveWithin } from './paths.js';
+import pkg from '@usebruno/lang';
+
+const { bruToJsonV2 } = pkg as {
+  bruToJsonV2: (bru: string) => any;
+};
 
 export class CollectionManager {
   
@@ -23,8 +29,10 @@ export class CollectionManager {
       // Validate input
       this.validateCollectionInput(input);
 
-      // Create collection directory
-      const collectionPath = join(input.outputPath, input.name);
+      // Create collection directory. `outputPath` is a caller-chosen root by
+      // design; confining `name` within it prevents a crafted name from
+      // escaping that root (in addition to the character validation above).
+      const collectionPath = resolveWithin(input.outputPath, input.name);
       await this.ensureDirectory(collectionPath);
 
       // Create bruno.json configuration
@@ -137,7 +145,7 @@ export class CollectionManager {
    */
   async createFolder(collectionPath: string, folderPath: string): Promise<FileOperationResult> {
     try {
-      const fullPath = join(collectionPath, folderPath);
+      const fullPath = resolveWithin(collectionPath, folderPath);
       await this.ensureDirectory(fullPath);
 
       return {
@@ -167,10 +175,19 @@ export class CollectionManager {
       const folders = await this.listFolders(collectionPath);
       const environments = await this.listEnvironments(collectionPath);
 
-      // Count requests by method (would need to parse .bru files)
+      // Count requests by method by parsing each .bru file.
       const requestsByMethod: Record<string, number> = {};
-      
-      // For now, return basic stats
+      for (const bruPath of requests) {
+        try {
+          const parsed = bruToJsonV2(await fs.readFile(bruPath, 'utf-8'));
+          const method = (parsed?.http?.method || 'unknown').toUpperCase();
+          requestsByMethod[method] = (requestsByMethod[method] || 0) + 1;
+        } catch {
+          // Skip files that fail to parse rather than aborting the whole scan.
+          requestsByMethod.unparsed = (requestsByMethod.unparsed || 0) + 1;
+        }
+      }
+
       return {
         totalRequests: requests.length,
         requestsByMethod,
@@ -184,6 +201,57 @@ export class CollectionManager {
         { originalError: error }
       );
     }
+  }
+
+  /**
+   * Find all Bruno collections (directories containing a bruno.json) under a
+   * directory. Returns each collection's name and path.
+   */
+  async listCollections(
+    rootPath: string,
+    maxDepth = 5
+  ): Promise<Array<{ name: string; path: string }>> {
+    const collections: Array<{ name: string; path: string }> = [];
+
+    const scan = async (dir: string, depth: number): Promise<void> => {
+      if (depth > maxDepth) return;
+
+      let entries;
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      const hasConfig = entries.some(e => e.isFile() && e.name === 'bruno.json');
+      if (hasConfig) {
+        let name = '';
+        try {
+          const cfg = JSON.parse(
+            await fs.readFile(join(dir, 'bruno.json'), 'utf-8')
+          ) as BrunoCollection;
+          name = cfg.name || '';
+        } catch {
+          // bruno.json present but unreadable/invalid — still report the dir.
+        }
+        collections.push({ name, path: dir });
+        // A collection root is a leaf for this scan; don't descend further.
+        return;
+      }
+
+      for (const entry of entries) {
+        if (
+          entry.isDirectory() &&
+          entry.name !== 'node_modules' &&
+          entry.name !== '.git'
+        ) {
+          await scan(join(dir, entry.name), depth + 1);
+        }
+      }
+    };
+
+    await scan(rootPath, 0);
+    return collections.sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /**

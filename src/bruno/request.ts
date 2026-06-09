@@ -4,7 +4,7 @@
  */
 
 import { promises as fs } from 'fs';
-import { join, dirname } from 'path';
+import { dirname } from 'path';
 import {
   BruFile,
   CreateRequestInput,
@@ -16,6 +16,13 @@ import {
   BodyType
 } from './types.js';
 import { generateBruFile } from './generator.js';
+import { resolveWithin } from './paths.js';
+import pkg from '@usebruno/lang';
+
+const { bruToJsonV2, jsonToBruV2 } = pkg as {
+  bruToJsonV2: (bru: string) => any;
+  jsonToBruV2: (json: unknown) => string;
+};
 
 export class RequestBuilder {
 
@@ -45,6 +52,48 @@ export class RequestBuilder {
         path: filePath
       };
 
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Add a pre-request / post-response / tests script to an existing .bru file.
+   *
+   * Parses the file with Bruno's own parser, appends the script to the relevant
+   * block, and re-serializes — so the result stays valid Bruno regardless of
+   * what the file already contained.
+   */
+  async addScript(
+    filePath: string,
+    scriptType: 'pre-request' | 'post-response' | 'tests',
+    script: string
+  ): Promise<FileOperationResult> {
+    try {
+      if (!filePath.endsWith('.bru')) {
+        throw new BrunoError('Target must be a .bru file', 'VALIDATION_ERROR');
+      }
+
+      const content = await fs.readFile(filePath, 'utf-8');
+      const json = bruToJsonV2(content);
+
+      const append = (existing: string | undefined): string =>
+        existing && existing.trim().length > 0 ? `${existing}\n${script}` : script;
+
+      if (scriptType === 'tests') {
+        json.tests = append(json.tests);
+      } else {
+        json.script = json.script || {};
+        const key = scriptType === 'pre-request' ? 'req' : 'res';
+        json.script[key] = append(json.script[key]);
+      }
+
+      await fs.writeFile(filePath, jsonToBruV2(json));
+
+      return { success: true, path: filePath };
     } catch (error) {
       return {
         success: false,
@@ -333,12 +382,17 @@ export class RequestBuilder {
    */
   private getRequestFilePath(input: CreateRequestInput): string {
     const fileName = this.sanitizeFileName(input.name) + '.bru';
-    
-    if (input.folder) {
-      return join(input.collectionPath, input.folder, fileName);
+    if (!fileName || fileName === '.bru') {
+      throw new BrunoError(
+        `Request name '${input.name}' produces an empty file name`,
+        'VALIDATION_ERROR'
+      );
     }
-    
-    return join(input.collectionPath, fileName);
+
+    // Confine the generated file within the collection so a crafted `folder`
+    // (e.g. '../../etc') cannot escape the collection root.
+    const segments = input.folder ? [input.folder, fileName] : [fileName];
+    return resolveWithin(input.collectionPath, ...segments);
   }
 
   /**

@@ -12,6 +12,12 @@ import {
   BrunoError,
   BruFileError
 } from './types.js';
+import { resolveWithin } from './paths.js';
+import pkg from '@usebruno/lang';
+
+const { envJsonToBruV2 } = pkg as {
+  envJsonToBruV2: (json: unknown) => string;
+};
 
 export class EnvironmentManager {
 
@@ -27,8 +33,9 @@ export class EnvironmentManager {
       const envDir = join(input.collectionPath, 'environments');
       await this.ensureDirectory(envDir);
 
-      // Create environment file
-      const envFilePath = join(envDir, `${input.name}.bru`);
+      // Confine the environment file within the collection's environments dir
+      // (defense in depth on top of the name-character validation above).
+      const envFilePath = resolveWithin(envDir, `${input.name}.bru`);
       const envContent = this.generateEnvironmentFile(input.name, input.variables);
 
       await fs.writeFile(envFilePath, envContent);
@@ -252,35 +259,21 @@ export class EnvironmentManager {
    * Generate environment file content in BRU format
    */
   private generateEnvironmentFile(
-    name: string,
+    _name: string,
     variables: Record<string, string | number | boolean>
   ): string {
-    const lines: string[] = [];
+    // Delegate to Bruno's official serializer so values are written in Bruno's
+    // real (unquoted) format rather than the previous `'...'`-wrapped output.
+    const json = {
+      variables: Object.entries(variables).map(([name, value]) => ({
+        name,
+        value: String(value),
+        enabled: true,
+        secret: false
+      }))
+    };
 
-    // Add header comment
-    lines.push(`# ${name} Environment`);
-    lines.push(`# Generated on ${new Date().toISOString()}`);
-    lines.push('');
-
-    // Add variables block
-    if (Object.keys(variables).length > 0) {
-      lines.push('vars {');
-      
-      Object.entries(variables).forEach(([key, value]) => {
-        const formattedValue = this.formatVariableValue(value);
-        lines.push(`  ${key}: ${formattedValue}`);
-      });
-      
-      lines.push('}');
-    } else {
-      lines.push('vars {');
-      lines.push('  # Add your environment variables here');
-      lines.push('  # baseUrl: \'https://api.example.com\'');
-      lines.push('  # apiKey: \'your-api-key\'');
-      lines.push('}');
-    }
-
-    return lines.join('\n') + '\n';
+    return envJsonToBruV2(json);
   }
 
   /**
@@ -310,17 +303,6 @@ export class EnvironmentManager {
     }
 
     return { name, variables };
-  }
-
-  /**
-   * Format variable value for BRU file
-   */
-  private formatVariableValue(value: string | number | boolean): string {
-    if (typeof value === 'string') {
-      // Use single quotes for strings in BRU format
-      return `'${value.replace(/'/g, "\\'")}'`;
-    }
-    return String(value);
   }
 
   /**
@@ -362,7 +344,7 @@ export class EnvironmentManager {
 
     // Check for invalid characters in environment name
     const invalidChars = /[<>:"/\\|?*\s]/;
-    if (invalidChars.test(input.name)) {
+    if (invalidChars.test(input.name) || input.name.includes('..')) {
       throw new BrunoError(
         'Environment name contains invalid characters or spaces',
         'VALIDATION_ERROR'
